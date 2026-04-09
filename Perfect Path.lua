@@ -1,6 +1,6 @@
 --[[
 -------------------------------------------------------------------
-SimplePath v3 – Heartbeat-based smooth pathfinding with auto re-path
+SimplePath v4 – Heartbeat-based smooth pathfinding with proper jumps & auto re-path
 Created by: @V3N0M_Z (modified)
 License: MIT
 -------------------------------------------------------------------
@@ -16,7 +16,7 @@ local DEFAULT_SETTINGS = {
 	JUMP_WHEN_STUCK = true;
 	VISUALIZE = true;
 	MAX_STEP = 16; -- Max movement step per frame for non-humanoids
-	REPATH_COOLDOWN = 1; -- Seconds between automatic re-path attempts
+	REPATH_COOLDOWN = 1; -- Seconds between automatic re-path
 }
 
 local Path = {}
@@ -33,6 +33,7 @@ visualWaypoint.CanCollide = false
 visualWaypoint.Material = Enum.Material.Neon
 visualWaypoint.Shape = Enum.PartType.Ball
 
+-- Helper output
 local function output(func, msg)
 	func(((func == error and "SimplePath Error: ") or "SimplePath: ")..msg)
 end
@@ -55,20 +56,28 @@ local function destroyVisualWaypoints(waypoints)
 	end
 end
 
+-- Waypoint reached event
 local function invokeWaypointReached(self)
 	local lastWp = self._waypoints[self._currentWaypoint - 1]
 	local nextWp = self._waypoints[self._currentWaypoint]
 	self._events.WaypointReached:Fire(self._agent, lastWp, nextWp)
 end
 
+-- Only jump if humanoid is grounded
+local function shouldJump(humanoid)
+	local state = humanoid:GetState()
+	return state == Enum.HumanoidStateType.Running or state == Enum.HumanoidStateType.Landed or state == Enum.HumanoidStateType.Freefall
+end
+
 local function setJump(self)
-	if self._humanoid and self._humanoid:GetState() ~= Enum.HumanoidStateType.Jumping and
-	   self._humanoid:GetState() ~= Enum.HumanoidStateType.Freefall then
+	if self._humanoid and shouldJump(self._humanoid) then
 		self._humanoid:ChangeState(Enum.HumanoidStateType.Jumping)
 	end
 end
 
+-- Compare position for stuck detection & auto re-path
 local function comparePosition(self)
+	if not self._agent.PrimaryPart then return end
 	local pos = self._agent.PrimaryPart.Position
 	if (pos - self._position._last).Magnitude <= 0.07 then
 		self._position._count += 1
@@ -76,13 +85,13 @@ local function comparePosition(self)
 		self._position._count = 0
 	end
 	self._position._last = pos
+
 	if self._position._count >= self._settings.COMPARISON_CHECKS then
 		if self._settings.JUMP_WHEN_STUCK then setJump(self) end
 		self._lastError = Path.ErrorType.AgentStuck
 		self._events.Error:Fire(Path.ErrorType.AgentStuck)
 		self._position._count = 0
 
-		-- Auto re-path
 		if os.clock() - (self._lastRepath or 0) >= self._settings.REPATH_COOLDOWN and self._target then
 			self._lastRepath = os.clock()
 			self:Run(self._target)
@@ -90,26 +99,25 @@ local function comparePosition(self)
 	end
 end
 
--- Heartbeat movement logic
+-- Heartbeat movement
 local function heartbeatMove(self, dt)
 	if not self._waypoints or not self._agent.PrimaryPart then return end
 	local wp = self._waypoints[self._currentWaypoint]
 	if not wp then return end
 
 	local pos = self._agent.PrimaryPart.Position
-	local dir = (wp.Position - pos)
+	local dir = wp.Position - pos
 	local dist = dir.Magnitude
 
-	-- Check if reached waypoint
 	if dist <= 1 then
 		if self._currentWaypoint < #self._waypoints then
 			invokeWaypointReached(self)
 			self._currentWaypoint += 1
 			wp = self._waypoints[self._currentWaypoint]
-			dir = (wp.Position - pos)
+			dir = wp.Position - pos
 			dist = dir.Magnitude
 		else
-			-- Reached final waypoint
+			-- Reached target
 			self._status = Path.StatusType.Idle
 			destroyVisualWaypoints(self._visualWaypoints)
 			self._events.Reached:Fire(self._agent, wp)
@@ -121,19 +129,21 @@ local function heartbeatMove(self, dt)
 		end
 	end
 
-	-- Jump if needed
-	if wp.Action == Enum.PathWaypointAction.Jump then setJump(self) end
+	-- Jump only once per waypoint if needed
+	if wp.Action == Enum.PathWaypointAction.Jump and self._lastJumpedWaypoint ~= self._currentWaypoint then
+		setJump(self)
+		self._lastJumpedWaypoint = self._currentWaypoint
+	end
 
-	-- Move incrementally
 	local moveDist = self._humanoid and self._humanoid.WalkSpeed * dt or self._settings.MAX_STEP * dt
 	local moveStep = dir.Unit * math.min(moveDist, dist)
+
 	if self._humanoid then
 		self._humanoid:Move(Vector3.new(moveStep.X,0,moveStep.Z), false)
 	else
 		self._agent:SetPrimaryPartCFrame(CFrame.new(pos + moveStep))
 	end
 
-	-- Stuck detection
 	if self._humanoid then comparePosition(self) end
 end
 
@@ -159,16 +169,15 @@ function Path.new(agent, agentParams, override)
 		_position = { _last = agent.PrimaryPart.Position, _count = 0 };
 		_currentWaypoint = 1;
 		_lastRepath = 0;
+		_lastJumpedWaypoint = nil;
 		_target = nil;
 	}, Path)
 
-	-- Path blocked event
 	self._path.Blocked:Connect(function(blockedWaypointIndex)
 		if self._currentWaypoint <= blockedWaypointIndex and self._currentWaypoint + 1 >= blockedWaypointIndex then
 			setJump(self)
 			self._events.Blocked:Fire(self._agent, self._waypoints[blockedWaypointIndex])
 
-			-- Auto re-path on block
 			if os.clock() - self._lastRepath >= self._settings.REPATH_COOLDOWN and self._target then
 				self._lastRepath = os.clock()
 				self:Run(self._target)
@@ -179,12 +188,14 @@ function Path.new(agent, agentParams, override)
 	return self
 end
 
+-- Run pathfinding
 function Path:Run(target)
 	if not target or not (typeof(target)=="Vector3" or target:IsA("BasePart")) then
 		output(error, "Target must be Vector3 or BasePart.")
 	end
 
 	self._target = target
+	self._lastJumpedWaypoint = nil
 
 	if os.clock() - (self._t or 0) <= self._settings.TIME_VARIANCE then
 		self._events.Error:Fire(Path.ErrorType.LimitReached)
@@ -195,6 +206,7 @@ function Path:Run(target)
 	local success, _ = pcall(function()
 		self._path:ComputeAsync(self._agent.PrimaryPart.Position, (typeof(target)=="Vector3" and target) or target.Position)
 	end)
+
 	if not success or self._path.Status == Enum.PathStatus.NoPath or #self._path:GetWaypoints() < 2 then
 		destroyVisualWaypoints(self._visualWaypoints)
 		self._events.Error:Fire(Path.ErrorType.ComputationError)
@@ -209,7 +221,6 @@ function Path:Run(target)
 		self._visualWaypoints = createVisualWaypoints(self._waypoints)
 	end
 
-	-- Start Heartbeat loop
 	if self._heartbeatConnection then self._heartbeatConnection:Disconnect() end
 	self._heartbeatConnection = RunService.Heartbeat:Connect(function(dt)
 		if self._status == Path.StatusType.Active then
