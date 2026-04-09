@@ -1,0 +1,265 @@
+--[[
+-------------------------------------------------------------------
+SimplePath v4 – Heartbeat-based smooth pathfinding with proper jumps & auto re-path
+Created by: @V3N0M_Z (modified)
+License: MIT
+-------------------------------------------------------------------
+]]
+
+local PathfindingService = game:GetService("PathfindingService")
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+
+local DEFAULT_SETTINGS = {
+	TIME_VARIANCE = 0.07;
+	COMPARISON_CHECKS = 5;
+	JUMP_WHEN_STUCK = true;
+	VISUALIZE = true;
+	MAX_STEP = 16; -- Max movement step per frame for non-humanoids
+	REPATH_COOLDOWN = 1; -- Seconds between automatic re-path
+}
+
+local Path = {}
+Path.__index = Path
+
+Path.StatusType = { Idle = "Idle", Active = "Active" }
+Path.ErrorType = { LimitReached = "LimitReached", TargetUnreachable = "TargetUnreachable", ComputationError = "ComputationError", AgentStuck = "AgentStuck" }
+
+-- Visual waypoint template
+local visualWaypoint = Instance.new("Part")
+visualWaypoint.Size = Vector3.new(0.3,0.3,0.3)
+visualWaypoint.Anchored = true
+visualWaypoint.CanCollide = false
+visualWaypoint.Material = Enum.Material.Neon
+visualWaypoint.Shape = Enum.PartType.Ball
+
+-- Helper output
+local function output(func, msg)
+	func(((func == error and "SimplePath Error: ") or "SimplePath: ")..msg)
+end
+
+local function createVisualWaypoints(waypoints)
+	local visuals = {}
+	for i, wp in ipairs(waypoints) do
+		local clone = visualWaypoint:Clone()
+		clone.Position = wp.Position
+		clone.Color = (i==#waypoints and Color3.fromRGB(0,255,0)) or (wp.Action==Enum.PathWaypointAction.Jump and Color3.fromRGB(255,0,0)) or Color3.fromRGB(255,139,0)
+		clone.Parent = workspace
+		table.insert(visuals, clone)
+	end
+	return visuals
+end
+
+local function destroyVisualWaypoints(waypoints)
+	if waypoints then
+		for _, wp in ipairs(waypoints) do wp:Destroy() end
+	end
+end
+
+-- Waypoint reached event
+local function invokeWaypointReached(self)
+	local lastWp = self._waypoints[self._currentWaypoint - 1]
+	local nextWp = self._waypoints[self._currentWaypoint]
+	self._events.WaypointReached:Fire(self._agent, lastWp, nextWp)
+end
+
+-- Only jump if humanoid is grounded
+local function shouldJump(humanoid)
+	local state = humanoid:GetState()
+	return state == Enum.HumanoidStateType.Running or state == Enum.HumanoidStateType.Landed or state == Enum.HumanoidStateType.Freefall
+end
+
+local function setJump(self)
+	if self._humanoid and shouldJump(self._humanoid) then
+		self._humanoid:ChangeState(Enum.HumanoidStateType.Jumping)
+	end
+end
+
+-- Compare position for stuck detection & auto re-path
+local function comparePosition(self)
+	if not self._agent.PrimaryPart then return end
+	local pos = self._agent.PrimaryPart.Position
+	if (pos - self._position._last).Magnitude <= 0.07 then
+		self._position._count += 1
+	else
+		self._position._count = 0
+	end
+	self._position._last = pos
+
+	if self._position._count >= self._settings.COMPARISON_CHECKS then
+		if self._settings.JUMP_WHEN_STUCK then setJump(self) end
+		self._lastError = Path.ErrorType.AgentStuck
+		self._events.Error:Fire(Path.ErrorType.AgentStuck)
+		self._position._count = 0
+
+		if os.clock() - (self._lastRepath or 0) >= self._settings.REPATH_COOLDOWN and self._target then
+			self._lastRepath = os.clock()
+			self:Run(self._target)
+		end
+	end
+end
+
+-- Heartbeat movement
+local function heartbeatMove(self, dt)
+	if not self._waypoints or not self._agent.PrimaryPart then return end
+	local wp = self._waypoints[self._currentWaypoint]
+	if not wp then return end
+
+	local pos = self._agent.PrimaryPart.Position
+	local dir = wp.Position - pos
+	local dist = dir.Magnitude
+
+	if dist <= 1 then
+		if self._currentWaypoint < #self._waypoints then
+			invokeWaypointReached(self)
+			self._currentWaypoint += 1
+			wp = self._waypoints[self._currentWaypoint]
+			dir = wp.Position - pos
+			dist = dir.Magnitude
+		else
+			-- Reached target
+			self._status = Path.StatusType.Idle
+			destroyVisualWaypoints(self._visualWaypoints)
+			self._events.Reached:Fire(self._agent, wp)
+			if self._heartbeatConnection then
+				self._heartbeatConnection:Disconnect()
+				self._heartbeatConnection = nil
+			end
+			return
+		end
+	end
+
+	-- Jump only once per waypoint if needed
+	if wp.Action == Enum.PathWaypointAction.Jump and self._lastJumpedWaypoint ~= self._currentWaypoint then
+		setJump(self)
+		self._lastJumpedWaypoint = self._currentWaypoint
+	end
+
+	local moveDist = self._humanoid and self._humanoid.WalkSpeed * dt or self._settings.MAX_STEP * dt
+	local moveStep = dir.Unit * math.min(moveDist, dist)
+
+	if self._humanoid then
+		self._humanoid:Move(Vector3.new(moveStep.X,0,moveStep.Z), false)
+	else
+		self._agent:SetPrimaryPartCFrame(CFrame.new(pos + moveStep))
+	end
+
+	if self._humanoid then comparePosition(self) end
+end
+
+-- Constructor
+function Path.new(agent, agentParams, override)
+	if not (agent and agent:IsA("Model") and agent.PrimaryPart) then
+		output(error, "Agent must be a Model with a PrimaryPart.")
+	end
+
+	local self = setmetatable({
+		_agent = agent;
+		_humanoid = agent:FindFirstChildOfClass("Humanoid");
+		_path = PathfindingService:CreatePath(agentParams);
+		_status = Path.StatusType.Idle;
+		_events = {
+			Reached = Instance.new("BindableEvent");
+			WaypointReached = Instance.new("BindableEvent");
+			Blocked = Instance.new("BindableEvent");
+			Error = Instance.new("BindableEvent");
+			Stopped = Instance.new("BindableEvent");
+		};
+		_settings = override or DEFAULT_SETTINGS;
+		_position = { _last = agent.PrimaryPart.Position, _count = 0 };
+		_currentWaypoint = 1;
+		_lastRepath = 0;
+		_lastJumpedWaypoint = nil;
+		_target = nil;
+	}, Path)
+
+	self._path.Blocked:Connect(function(blockedWaypointIndex)
+		if self._currentWaypoint <= blockedWaypointIndex and self._currentWaypoint + 1 >= blockedWaypointIndex then
+			setJump(self)
+			self._events.Blocked:Fire(self._agent, self._waypoints[blockedWaypointIndex])
+
+			if os.clock() - self._lastRepath >= self._settings.REPATH_COOLDOWN and self._target then
+				self._lastRepath = os.clock()
+				self:Run(self._target)
+			end
+		end
+	end)
+
+	return self
+end
+
+-- Run pathfinding
+function Path:Run(target)
+	if not target or not (typeof(target)=="Vector3" or target:IsA("BasePart")) then
+		output(error, "Target must be Vector3 or BasePart.")
+	end
+
+	self._target = target
+	self._lastJumpedWaypoint = nil
+
+	if os.clock() - (self._t or 0) <= self._settings.TIME_VARIANCE then
+		self._events.Error:Fire(Path.ErrorType.LimitReached)
+		return false
+	end
+	self._t = os.clock()
+
+	local success, _ = pcall(function()
+		self._path:ComputeAsync(self._agent.PrimaryPart.Position, (typeof(target)=="Vector3" and target) or target.Position)
+	end)
+
+	if not success or self._path.Status == Enum.PathStatus.NoPath or #self._path:GetWaypoints() < 2 then
+		destroyVisualWaypoints(self._visualWaypoints)
+		self._events.Error:Fire(Path.ErrorType.ComputationError)
+		return false
+	end
+
+	self._waypoints = self._path:GetWaypoints()
+	self._currentWaypoint = 1
+	self._status = Path.StatusType.Active
+	destroyVisualWaypoints(self._visualWaypoints)
+	if self._settings.VISUALIZE then
+		self._visualWaypoints = createVisualWaypoints(self._waypoints)
+	end
+
+	if self._heartbeatConnection then self._heartbeatConnection:Disconnect() end
+	self._heartbeatConnection = RunService.Heartbeat:Connect(function(dt)
+		if self._status == Path.StatusType.Active then
+			heartbeatMove(self, dt)
+		end
+	end)
+
+	return true
+end
+
+function Path:Stop()
+	self._status = Path.StatusType.Idle
+	destroyVisualWaypoints(self._visualWaypoints)
+	if self._heartbeatConnection then
+		self._heartbeatConnection:Disconnect()
+		self._heartbeatConnection = nil
+	end
+	self._events.Stopped:Fire(self._agent)
+end
+
+function Path:Destroy()
+	self:Stop()
+	for _, ev in pairs(self._events) do ev:Destroy() end
+	self._path:Destroy()
+	for k,_ in pairs(self) do self[k] = nil end
+	setmetatable(self, nil)
+end
+
+function Path.GetNearestCharacter(fromPos)
+	local nearest, dist = nil, math.huge
+	for _, p in pairs(Players:GetPlayers()) do
+		if p.Character and p.Character.PrimaryPart then
+			local d = (p.Character.PrimaryPart.Position - fromPos).Magnitude
+			if d < dist then
+				nearest, dist = p.Character, d
+			end
+		end
+	end
+	return nearest
+end
+
+return Path
